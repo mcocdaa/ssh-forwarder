@@ -1,0 +1,88 @@
+#!/bin/bash
+set -euo pipefail
+
+DIR=$(dirname $(readlink -e ${BASH_SOURCE[0]}))
+CONF="$DIR/forwards.conf"
+SERVICE=ssh-forwarder.service
+
+port_ok() {
+    [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+run() {
+    local host
+    host=$(sed -n 's/^SSH_HOST=//p' "$CONF")
+    [[ -n "$host" ]] || { echo "缺少 SSH_HOST"; exit 1; }
+
+    local args=(
+        -N -T
+        -o BatchMode=yes
+        -o ExitOnForwardFailure=yes
+        -o ServerAliveInterval=30
+        -o ServerAliveCountMax=3
+    )
+
+    while IFS='|' read -r local_port remote_host remote_port desc; do
+        [[ "$local_port" =~ ^[0-9]+$ ]] || continue
+        args+=(-L "127.0.0.1:$local_port:$remote_host:$remote_port")
+        echo "127.0.0.1:$local_port -> $remote_host:$remote_port ($desc)"
+    done < "$CONF"
+
+    exec ssh "${args[@]}" "$host"
+}
+
+add() {
+    local lp=${1:?本地端口}
+    local host=${2:?目标地址}
+    local rp=${3:?目标端口}
+    local desc=${4:-}
+
+    port_ok "$lp" && port_ok "$rp" || {
+        echo "端口无效"
+        exit 1
+    }
+
+    grep -q "^$lp|" "$CONF" && {
+        echo "端口 $lp 已存在"
+        exit 1
+    }
+
+    echo "$lp|$host|$rp|$desc" >> "$CONF"
+    systemctl restart "$SERVICE"
+}
+
+remove() {
+    local port=${1:?本地端口}
+
+    port_ok "$port" || {
+        echo "端口无效"
+        exit 1
+    }
+
+    grep -q "^$port|" "$CONF" || {
+        echo "端口不存在"
+        exit 1
+    }
+
+    sed -i "/^$port|/d" "$CONF"
+    systemctl restart "$SERVICE"
+}
+
+list() {
+    column -s '|' -t < <(grep -E '^[0-9]+\|' "$CONF")
+}
+
+case "${1:-help}" in
+    run) run ;;
+    start|stop|restart) systemctl "$1" "$SERVICE" ;;
+    status) systemctl --no-pager status "$SERVICE" ;;
+    logs) journalctl -fu "$SERVICE" ;;
+    list) list ;;
+    add) shift; add "$@" ;;
+    remove|delete) shift; remove "$@" ;;
+    *)
+        echo "ssh-forward {start|stop|restart|status|logs|list}"
+        echo "ssh-forward add 本地端口 目标地址 目标端口 [备注]"
+        echo "ssh-forward remove 本地端口"
+        ;;
+esac

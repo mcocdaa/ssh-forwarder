@@ -1,0 +1,13 @@
+[Unit]
+Description=SSH Port Forwarder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ssh-forward run
+Restart=always
+RestartSec=5
+Environment=HOME=/root
+
+[Install]
+WantedBy=multi-user.target
