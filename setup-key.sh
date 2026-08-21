@@ -53,7 +53,7 @@ if grep -qx "Host $HOST_ALIAS" "$SSH_CONFIG"; then
 else
     {
         echo ""
-        echo "Host $HOST_ALIAS"
+        echo "Host $HOST_PART"
         echo "    HostName $HOST_PART"
         [[ -n "$USER_PART" ]] && echo "    User $USER_PART"
         echo "    IdentityFile $KEY"
