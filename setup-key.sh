@@ -1,17 +1,39 @@
 #!/bin/bash
 set -euo pipefail
 
-# 用法: setup-key [SSH_DIR]
+# 用法: setup-key [SSH_DIR] [SSH_HOST]
 #   SSH_DIR 默认 ~/.ssh（当前用户）；给 systemd 服务(root)配: sudo ./setup-key /root/.ssh
+#   SSH_HOST 可选；若 forwards.conf 存在多个 SSH_HOST 且未传参，会提示选择
 # 流程: 读 forwards.conf 的 SSH_HOST -> 生成 ed25519 key -> ssh-copy-id 部署公钥 -> 写 ssh config
 # key 使用空 passphrase（适配后台服务）；如需 passphrase 把 -N '' 改为 -N '你的密码'
 
 SSH_DIR="${1:-${SSH_DIR:-$HOME/.ssh}}"
+TARGET_HOST="${2:-}"
 DIR="$(dirname "$(readlink -e "${BASH_SOURCE[0]}")")"
 CONF="$DIR/forwards.conf"
 
-SSH_HOST=$(sed -n 's/^SSH_HOST=//p' "$CONF")
-[[ -n "$SSH_HOST" ]] || { echo "错误：$CONF 缺少 SSH_HOST"; exit 1; }
+if [[ -n "$TARGET_HOST" ]]; then
+    SSH_HOST="$TARGET_HOST"
+else
+    mapfile -t SSH_HOSTS < <(sed -n 's/^SSH_HOST=//p' "$CONF" | awk '!seen[$0]++')
+    [[ ${#SSH_HOSTS[@]} -gt 0 ]] || { echo "错误：$CONF 缺少 SSH_HOST"; exit 1; }
+    if (( ${#SSH_HOSTS[@]} == 1 )); then
+        SSH_HOST="${SSH_HOSTS[0]}"
+    else
+        echo "检测到多个 SSH_HOST："
+        for i in "${!SSH_HOSTS[@]}"; do
+            echo "  $((i + 1))) ${SSH_HOSTS[$i]}"
+        done
+        default_idx=${#SSH_HOSTS[@]}
+        read -r -p "请选择 [1-$default_idx，默认 $default_idx (${SSH_HOSTS[$((default_idx - 1))]})]: " choice
+        choice="${choice:-$default_idx}"
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > default_idx )); then
+            echo "错误：选择无效"
+            exit 1
+        fi
+        SSH_HOST="${SSH_HOSTS[$((choice - 1))]}"
+    fi
+fi
 
 if [[ "$SSH_HOST" == *@* ]]; then
     USER_PART="${SSH_HOST%@*}"

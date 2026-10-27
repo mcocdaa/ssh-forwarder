@@ -10,11 +10,39 @@ port_ok() {
 }
 
 run() {
-    local host
-    host=$(sed -n 's/^SSH_HOST=//p' "$CONF")
-    [[ -n "$host" ]] || { echo "缺少 SSH_HOST"; exit 1; }
+    local current_host=""
+    local -a hosts=()
+    local -A host_forwards=()
 
-    local args=(
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%$'\r'}"
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^SSH_HOST=(.+)$ ]]; then
+            current_host="${BASH_REMATCH[1]}"
+            if [[ -z "${host_forwards[$current_host]+x}" ]]; then
+                hosts+=("$current_host")
+                host_forwards["$current_host"]=""
+            fi
+            continue
+        fi
+
+        IFS='|' read -r local_port remote_host remote_port desc bind_host <<< "$line"
+        [[ "$local_port" =~ ^[0-9]+$ ]] || continue
+        [[ -n "$current_host" ]] || { echo "缺少 SSH_HOST"; exit 1; }
+
+        bind_host=${bind_host:-127.0.0.1}
+        case "$bind_host" in
+            127.0.0.1|0.0.0.0) ;;
+            *) echo "监听地址无效: $bind_host"; exit 1 ;;
+        esac
+
+        host_forwards["$current_host"]+="$bind_host:$local_port:$remote_host:$remote_port"$'\n'
+        echo "[$current_host] $bind_host:$local_port -> $remote_host:$remote_port ($desc)"
+    done < "$CONF"
+
+    [[ ${#hosts[@]} -gt 0 ]] || { echo "缺少 SSH_HOST"; exit 1; }
+
+    local base_args=(
         -N -T
         -o BatchMode=yes
         -o ExitOnForwardFailure=yes
@@ -22,32 +50,85 @@ run() {
         -o ServerAliveCountMax=3
     )
 
-    while IFS='|' read -r local_port remote_host remote_port desc; do
-        [[ "$local_port" =~ ^[0-9]+$ ]] || continue
-        args+=(-L "127.0.0.1:$local_port:$remote_host:$remote_port")
-        echo "127.0.0.1:$local_port -> $remote_host:$remote_port ($desc)"
-    done < "$CONF"
+    local -a active_hosts=()
+    local h
+    for h in "${hosts[@]}"; do
+        [[ -n "${host_forwards[$h]}" ]] && active_hosts+=("$h")
+    done
+    [[ ${#active_hosts[@]} -gt 0 ]] || { echo "没有有效的转发规则"; exit 1; }
 
-    exec ssh "${args[@]}" "$host"
+    if (( ${#active_hosts[@]} == 1 )); then
+        h="${active_hosts[0]}"
+        local args=("${base_args[@]}")
+        local spec
+        while IFS= read -r spec; do
+            [[ -n "$spec" ]] && args+=(-L "$spec")
+        done <<< "${host_forwards[$h]}"
+        exec ssh "${args[@]}" "$h"
+    fi
+
+    trap 'kill $(jobs -p) 2>/dev/null || true; exit 0' INT TERM
+    for h in "${active_hosts[@]}"; do
+        local args=("${base_args[@]}")
+        local spec
+        while IFS= read -r spec; do
+            [[ -n "$spec" ]] && args+=(-L "$spec")
+        done <<< "${host_forwards[$h]}"
+        (
+            trap 'exit 0' INT TERM
+            while true; do
+                ssh "${args[@]}" "$h" || true
+                sleep 5 &
+                wait $! || exit 0
+            done
+        ) &
+    done
+    wait
 }
 
 add() {
+    local ssh_host=""
+    if [[ "${1:-}" == "--host" || "${1:-}" == "-H" ]]; then
+        ssh_host=${2:?缺少 SSH_HOST}
+        shift 2
+    fi
+
     local lp=${1:?本地端口}
     local host=${2:?目标地址}
     local rp=${3:?目标端口}
     local desc=${4:-}
+    local bind_host=${5:-}
 
     port_ok "$lp" && port_ok "$rp" || {
         echo "端口无效"
         exit 1
     }
 
+    if [[ -n "$bind_host" ]]; then
+        case "$bind_host" in
+            127.0.0.1|0.0.0.0) ;;
+            *) echo "监听地址无效: $bind_host"; exit 1 ;;
+        esac
+    fi
+
     grep -q "^$lp|" "$CONF" && {
         echo "端口 $lp 已存在"
         exit 1
     }
 
-    echo "$lp|$host|$rp|$desc" >> "$CONF"
+    if [[ -n "$ssh_host" ]]; then
+        local last_host
+        last_host=$(sed -n 's/^SSH_HOST=//p' "$CONF" | tail -n 1)
+        if [[ "$last_host" != "$ssh_host" ]]; then
+            echo "SSH_HOST=$ssh_host" >> "$CONF"
+        fi
+    fi
+
+    if [[ -n "$bind_host" ]]; then
+        echo "$lp|$host|$rp|$desc|$bind_host" >> "$CONF"
+    else
+        echo "$lp|$host|$rp|$desc" >> "$CONF"
+    fi
     systemctl restart "$SERVICE"
 }
 
@@ -69,7 +150,13 @@ remove() {
 }
 
 list() {
-    column -s '|' -t < <(grep -E '^[0-9]+\|' "$CONF")
+    awk -F'|' '
+        /^SSH_HOST=/ { host = substr($0, 10); next }
+        /^[0-9]+\|/ {
+            bind = ($5 != "" ? $5 : "127.0.0.1")
+            printf "%s|%s|%s|%s|%s|%s\n", host, $1, $2, $3, $4, bind
+        }
+    ' "$CONF" | column -s '|' -t
 }
 
 case "${1:-help}" in
@@ -82,7 +169,7 @@ case "${1:-help}" in
     remove|delete) shift; remove "$@" ;;
     *)
         echo "ssh-forward {start|stop|restart|status|logs|list}"
-        echo "ssh-forward add 本地端口 目标地址 目标端口 [备注]"
+        echo "ssh-forward add [--host SSH_HOST] 本地端口 目标地址 目标端口 [备注] [监听地址]"
         echo "ssh-forward remove 本地端口"
         ;;
 esac
