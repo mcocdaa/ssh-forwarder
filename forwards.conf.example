@@ -1,0 +1,14 @@
+# forwards.conf 示例配置（复制到 forwards.conf 并按需修改）
+# 格式：
+#   SSH_HOST=用户名@主机地址（或 ~/.ssh/config 中的 Host 别名）
+#   本地端口|目标地址|目标端口|备注[|监听地址]
+# 说明：
+#   - 后续转发规则归属最近声明的 SSH_HOST
+#   - 监听地址可选，默认为 127.0.0.1，可设为 0.0.0.0
+
+SSH_HOST=ubuntu@10.0.0.10
+8080|127.0.0.1|80|web-console
+8100|10.0.1.20|8000|control-plane|0.0.0.0
+
+SSH_HOST=ubuntu@10.0.0.20
+30080|127.0.0.1|8000|inference-api

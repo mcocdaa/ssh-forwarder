@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-DIR=$(dirname $(readlink -e ${BASH_SOURCE[0]}))
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)"
 CONF="$DIR/forwards.conf"
 SERVICE=ssh-forwarder.service
 
@@ -9,20 +10,42 @@ port_ok() {
     [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
 }
 
+forward() {
+    local ssh_host="$1" spec="$2" child=""
+    trap - EXIT
+    trap 'if [[ -n "$child" ]]; then kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; fi; exit 0' INT TERM
+
+    while true; do
+        ssh -N -T \
+            -o BatchMode=yes \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=3 \
+            -o ControlMaster=no \
+            -o ControlPath=none \
+            -L "$spec" "$ssh_host" &
+        child=$!
+        wait "$child" || true
+        sleep 5 &
+        child=$!
+        wait "$child" || true
+    done
+}
+
 run() {
-    local current_host=""
-    local -a hosts=()
-    local -A host_forwards=()
+    if [[ ! -f "$CONF" ]]; then
+        echo "forwards.conf 不存在，跳过转发"
+        exit 0
+    fi
+
+    local current_host="" local_port remote_host remote_port desc bind_host line
+    local -a hosts=() forwards=() workers=()
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%%$'\r'}"
         [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
         if [[ "$line" =~ ^SSH_HOST=(.+)$ ]]; then
             current_host="${BASH_REMATCH[1]}"
-            if [[ -z "${host_forwards[$current_host]+x}" ]]; then
-                hosts+=("$current_host")
-                host_forwards["$current_host"]=""
-            fi
             continue
         fi
 
@@ -36,54 +59,21 @@ run() {
             *) echo "监听地址无效: $bind_host"; exit 1 ;;
         esac
 
-        host_forwards["$current_host"]+="$bind_host:$local_port:$remote_host:$remote_port"$'\n'
+        hosts+=("$current_host")
+        forwards+=("$bind_host:$local_port:$remote_host:$remote_port")
         echo "[$current_host] $bind_host:$local_port -> $remote_host:$remote_port ($desc)"
     done < "$CONF"
 
-    [[ ${#hosts[@]} -gt 0 ]] || { echo "缺少 SSH_HOST"; exit 1; }
-
-    local base_args=(
-        -N -T
-        -o BatchMode=yes
-        -o ExitOnForwardFailure=yes
-        -o ServerAliveInterval=30
-        -o ServerAliveCountMax=3
-    )
-
-    local -a active_hosts=()
-    local h
-    for h in "${hosts[@]}"; do
-        [[ -n "${host_forwards[$h]}" ]] && active_hosts+=("$h")
-    done
-    [[ ${#active_hosts[@]} -gt 0 ]] || { echo "没有有效的转发规则"; exit 1; }
-
-    if (( ${#active_hosts[@]} == 1 )); then
-        h="${active_hosts[0]}"
-        local args=("${base_args[@]}")
-        local spec
-        while IFS= read -r spec; do
-            [[ -n "$spec" ]] && args+=(-L "$spec")
-        done <<< "${host_forwards[$h]}"
-        exec ssh "${args[@]}" "$h"
-    fi
-
-    trap 'kill $(jobs -p) 2>/dev/null || true; exit 0' INT TERM
-    for h in "${active_hosts[@]}"; do
-        local args=("${base_args[@]}")
-        local spec
-        while IFS= read -r spec; do
-            [[ -n "$spec" ]] && args+=(-L "$spec")
-        done <<< "${host_forwards[$h]}"
-        (
-            trap 'exit 0' INT TERM
-            while true; do
-                ssh "${args[@]}" "$h" || true
-                sleep 5 &
-                wait $! || exit 0
-            done
-        ) &
+    [[ ${#forwards[@]} -gt 0 ]] || { echo "没有有效的转发规则"; exit 1; }
+    trap 'kill "${workers[@]}" 2>/dev/null || true; wait || true' EXIT
+    trap 'exit 0' INT TERM
+    local i
+    for i in "${!forwards[@]}"; do
+        forward "${hosts[$i]}" "${forwards[$i]}" &
+        workers+=("$!")
     done
     wait
+    trap - EXIT INT TERM
 }
 
 add() {
@@ -99,10 +89,25 @@ add() {
     local desc=${4:-}
     local bind_host=${5:-}
 
-    port_ok "$lp" && port_ok "$rp" || {
+    if ! port_ok "$lp" || ! port_ok "$rp"; then
         echo "端口无效"
         exit 1
-    }
+    fi
+
+    if [[ -n "$ssh_host" && ( "$ssh_host" == *"|"* || "$ssh_host" =~ [[:space:]] ) ]]; then
+        echo "SSH_HOST 不能包含 '|' 或空白字符"
+        exit 1
+    fi
+
+    if [[ "$host" == *"|"* || "$host" =~ [[:space:]] ]]; then
+        echo "目标地址不能包含 '|' 或空白字符"
+        exit 1
+    fi
+
+    if [[ "$desc" == *"|"* || "$desc" == *$'\n'* || "$desc" == *$'\r'* ]]; then
+        echo "备注不能包含 '|' 或换行符"
+        exit 1
+    fi
 
     if [[ -n "$bind_host" ]]; then
         case "$bind_host" in
@@ -111,10 +116,22 @@ add() {
         esac
     fi
 
-    grep -q "^$lp|" "$CONF" && {
+    if [[ ! -f "$CONF" ]]; then
+        if [[ -z "$ssh_host" ]]; then
+            echo "forwards.conf 不存在，首次添加规则请使用 --host 指定 SSH_HOST"
+            exit 1
+        fi
+        : > "$CONF"
+        chmod 600 "$CONF"
+    elif [[ -z "$ssh_host" ]] && ! grep -q '^SSH_HOST=' "$CONF"; then
+        echo "forwards.conf 中缺少 SSH_HOST，请使用 --host 指定 SSH_HOST"
+        exit 1
+    fi
+
+    if grep -q "^${lp}|" "$CONF"; then
         echo "端口 $lp 已存在"
         exit 1
-    }
+    fi
 
     if [[ -n "$ssh_host" ]]; then
         local last_host
@@ -135,28 +152,46 @@ add() {
 remove() {
     local port=${1:?本地端口}
 
-    port_ok "$port" || {
+    if ! port_ok "$port"; then
         echo "端口无效"
         exit 1
-    }
+    fi
 
-    grep -q "^$port|" "$CONF" || {
+    if [[ ! -f "$CONF" ]]; then
+        echo "forwards.conf 不存在，无需删除"
+        return 0
+    fi
+
+    if ! grep -q "^${port}|" "$CONF"; then
         echo "端口不存在"
         exit 1
-    }
+    fi
 
-    sed -i "/^$port|/d" "$CONF"
+    sed -i "/^${port}|/d" "$CONF"
     systemctl restart "$SERVICE"
 }
 
 list() {
-    awk -F'|' '
+    if [[ ! -f "$CONF" ]]; then
+        echo "暂无转发规则 (forwards.conf 未创建)"
+        return 0
+    fi
+
+    local rows
+    rows=$(awk -F'|' '
         /^SSH_HOST=/ { host = substr($0, 10); next }
         /^[0-9]+\|/ {
             bind = ($5 != "" ? $5 : "127.0.0.1")
             printf "%s|%s|%s|%s|%s|%s\n", host, $1, $2, $3, $4, bind
         }
-    ' "$CONF" | column -s '|' -t
+    ' "$CONF")
+
+    if [[ -z "$rows" ]]; then
+        echo "暂无转发规则"
+        return 0
+    fi
+
+    printf '%s\n' "$rows" | column -s '|' -t
 }
 
 case "${1:-help}" in
@@ -166,7 +201,7 @@ case "${1:-help}" in
     logs) journalctl -fu "$SERVICE" ;;
     list) list ;;
     add) shift; add "$@" ;;
-    remove|delete) shift; remove "$@" ;;
+    remove|delete|del) shift; remove "$@" ;;
     *)
         echo "ssh-forward {start|stop|restart|status|logs|list}"
         echo "ssh-forward add [--host SSH_HOST] 本地端口 目标地址 目标端口 [备注] [监听地址]"

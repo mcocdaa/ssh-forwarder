@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: bash -n ssh-forward install.sh uninstall.sh setup-key.sh
+
+      - name: ShellCheck
+        run: shellcheck ssh-forward install.sh uninstall.sh setup-key.sh
+
+      - name: Run unit tests
+        run: python3 -B -m unittest discover -s tests -v
